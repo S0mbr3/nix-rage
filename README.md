@@ -20,14 +20,16 @@ You need to add plugin-files inside you `nix.conf` (`~/.config/nix/nix.conf`, `/
 
 ```
 # with nix-env:
-plugin-files = /home/YOURUSERNAMEHERE/.nix-profile/lib/libnix_doc_plugin.so
+plugin-files = /home/YOURUSERNAMEHERE/.nix-profile/lib/libnix_rage.<so|dylib>
 
-# with cago build:
-plugin-files = /path/to/repo/target/debug/libnix_rage.so
+# with cargo build:
+plugin-files = /path/to/repo/target/debug/libnix_rage.<so|dylib>
 
 # inside nix config:
-plugin-files = ${pkgs.nix-rage}/lib/libnix_rage.so
+plugin-files = ${pkgs.nix-rage}/lib/libnix_rage${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}
 ```
+
+When using the flake package, `packages.<system>.default` follows the Nix version of the evaluator running the build via `builtins.nixVersion`. This matters for `darwin-rebuild` and similar bootstraps, where the current system Nix may lag behind the target `pkgs.nix`.
 
 Nix Flake example:
 
@@ -45,13 +47,13 @@ Nix Flake example:
       myhostname = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
         modules = [
-          {
+          ({ pkgs, ... }: {
             nix.extraOptions = let
               nix-rage-package = nix-rage.packages."x86_64-linux".default;
             in ''
-              plugin-files = ${nix-rage-package}/lib/libnix_rage.so
+              plugin-files = ${nix-rage-package}/lib/libnix_rage${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}
             '';
-          }
+          })
           #...
         ];
       };
@@ -133,4 +135,3 @@ You might also be interested in:
 ## License
 
 nix-rage is licensed under the MIT License. See the [LICENSE](LICENSE) file for more information.
-

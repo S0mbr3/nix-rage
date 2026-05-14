@@ -33,6 +33,8 @@
         lib,
         ...
       }: let
+        normalizeNixVersion = version: lib.head (lib.splitString "+" version);
+        evaluatorNixVersion = normalizeNixVersion builtins.nixVersion;
         toolchain = pkgs.fenix.stable.withComponents [
           "cargo"
           "clippy"
@@ -47,6 +49,16 @@
           && (builtins.tryEval nix_pkg).success
           && builtins.compareVersions nix_pkg.version "2.24" >= 0)
         pkgs.nixVersions;
+        evaluator_nix_pkgs = builtins.attrValues (lib.filterAttrs (_: nix_pkg:
+          normalizeNixVersion nix_pkg.version == evaluatorNixVersion)
+        nix_pkgs);
+        evaluator_nix_pkg =
+          if evaluator_nix_pkgs != [] then
+            builtins.head evaluator_nix_pkgs
+          else
+            null;
+        sharedLibraryName = pkg:
+          "${lib.getLib pkg}/lib/libnix_rage${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
         commonArgs = nix_pkg: {
           src = lib.cleanSourceWith {
             src = lib.cleanSource ./.;
@@ -149,7 +161,7 @@
                 nodes.machine1 = {
                   nix.package = nix_pkg;
                   nix.extraOptions = ''
-                    plugin-files = ${self'.packages."nix-rage-nix-${nix_version}"}/lib/libnix_rage.so
+                    plugin-files = ${sharedLibraryName self'.packages."nix-rage-nix-${nix_version}"}
                     experimental-features = nix-command
                   '';
                 };
@@ -210,7 +222,12 @@
           })
           nix_pkgs
           // {
-            nix-rage = self'.packages.nix-rage-nix-stable;
+            nix-rage-current =
+              if evaluator_nix_pkg != null then
+                nix-rage evaluator_nix_pkg
+              else
+                self'.packages.nix-rage-nix-stable;
+            nix-rage = self'.packages.nix-rage-current;
             default = self'.packages.nix-rage;
           };
       };

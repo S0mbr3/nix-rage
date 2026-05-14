@@ -92,6 +92,33 @@ char *decrypt_content(EvalState &state, const PosIdx pos, Value **args) {
   return content;
 }
 
+static nix::PrimOp make_primop(const char *name,
+                               std::initializer_list<std::string> args,
+                               const char *doc, nix::PrimOpFun *impl) {
+#if NIX_VERSION_GE(2, 34, 00)
+  nix::PrimOp primop{
+      .name = name,
+      .args = args,
+      .arity = args.size(),
+      .doc = doc,
+      .addTrace = true,
+      .impl = impl,
+      .experimentalFeature = {},
+      .internal = false,
+  };
+#else
+  nix::PrimOp primop{
+      .name = name,
+      .args = args,
+      .arity = args.size(),
+      .doc = doc,
+      .fun = impl,
+      .experimentalFeature = {},
+  };
+#endif
+  return primop;
+}
+
 void prim_importAge(EvalState &state, const PosIdx pos, Value **args,
                     Value &v) {
   auto content = decrypt_content(state, pos, args);
@@ -123,24 +150,18 @@ void prim_readAgeFile(EvalState &state, const PosIdx pos, Value **args,
   if (!content) {
     throw Error("decrypt error while evaluation");
   };
+#if NIX_VERSION_GE(2, 34, 00)
+  v.mkString(content, state.mem);
+#else
   v.mkString(content);
+#endif
 }
 
 static std::vector<RegisterPrimOp> primops = std::vector{
-    nix::RegisterPrimOp(nix::PrimOp{
-        .name = "importAge",
-        .args = {"identities", "path", "configs"},
-        .arity = 3,
-        .doc = "Import encypted .nix file",
-        .fun = prim_importAge,
-        .experimentalFeature = {},
-    }),
-    nix::RegisterPrimOp(nix::PrimOp{
-        .name = "readAgeFile",
-        .args = {"identities", "path", "configs"},
-        .arity = 3,
-        .doc = "Read encrypted file",
-        .fun = prim_readAgeFile,
-        .experimentalFeature = {},
-    }),
+    nix::RegisterPrimOp(make_primop(
+        "importAge", {"identities", "path", "configs"},
+        "Import encypted .nix file", prim_importAge)),
+    nix::RegisterPrimOp(make_primop("readAgeFile",
+                                    {"identities", "path", "configs"},
+                                    "Read encrypted file", prim_readAgeFile)),
 };
