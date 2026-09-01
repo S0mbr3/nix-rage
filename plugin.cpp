@@ -1,3 +1,11 @@
+#if defined(__APPLE__)
+// The plugin uses the host evaluator's libc++ rather than linking a second
+// C++ runtime. Keep the standard-library ABI at Apple's stable ABI-1 even
+// when the build environment supplies newer nixpkgs libc++ headers.
+#undef _LIBCPP_ABI_VERSION
+#define _LIBCPP_ABI_VERSION 1
+#endif
+
 #define VERSION_ENCODE(major, minor, patch)                                    \
   ((major) * 10000 + (minor) * 100 + (patch))
 #define NIX_VERSION_NUM                                                        \
@@ -16,13 +24,24 @@
 #endif
 
 #include <format>
+#include <string>
 #include <vector>
 
 using namespace nix;
 
+#if defined(__APPLE__)
+// Newer libc++ headers can leave these basic_string members as external
+// references, while the active Darwin evaluator's system libc++ keeps them
+// inline. Emit the compatibility methods in the plugin so no second libc++
+// dylib is needed at runtime.
+template class std::basic_string<char>;
+#endif
+
 extern "C" {
-char *nix_rage_decrypt(const char **identities, size_t size,
-                       const char *filename, bool cache);
+char *nix_rage_decrypt(const char **identities, const size_t *identity_sizes,
+                       size_t identity_count, const char *encrypted,
+                       size_t encrypted_size, const char *cache_key,
+                       bool cache);
 char *nix_rage_decrypt_error();
 }
 
@@ -42,16 +61,27 @@ char *decrypt_content(EvalState &state, const PosIdx pos, Value **args) {
         .atPos(pos)
         .debugThrow();
   }
-  auto filename = const_cast<const char *>(
-#if NIX_VERSION_GE(2, 30, 00)
-      args[1]->pathStr()
-#else
-      args[1]->payload.path.path
-#endif
-  );
 
-  std::vector<const char *> identities;
-  identities.reserve(args[0]->listSize());
+  auto cache_value = args[2]->attrs()->get(state.symbols.create("cache"));
+  bool cache = true;
+  if (cache_value) {
+    cache = cache_value->value->boolean();
+  }
+
+  std::string encrypted;
+  std::string cache_key;
+#if NIX_VERSION_GE(2, 30, 00)
+  auto encrypted_path = args[1]->path();
+  encrypted = encrypted_path.readFile();
+  cache_key = encrypted_path.to_string();
+#else
+  auto filename = args[1]->payload.path.path;
+  encrypted = readFile(Path(filename));
+  cache_key = filename;
+#endif
+
+  std::vector<std::string> identity_contents;
+  identity_contents.reserve(args[0]->listSize());
 #if NIX_VERSION_GE(2, 30, 00)
   for (auto elem : args[0]->listView()) {
 #else
@@ -66,20 +96,24 @@ char *decrypt_content(EvalState &state, const PosIdx pos, Value **args) {
           .debugThrow();
     }
 #if NIX_VERSION_GE(2, 30, 00)
-    auto path = elem->pathStr();
+    identity_contents.push_back(elem->path().readFile());
 #else
-    auto path = elem->payload.path.path;
+    identity_contents.push_back(readFile(Path(elem->payload.path.path)));
 #endif
-    identities.push_back(const_cast<const char *>(path));
   }
 
-  auto cache_value = args[2]->attrs()->get(state.symbols.create("cache"));
-  bool cache = true;
-  if (cache_value) {
-    cache = cache_value->value->boolean();
+  std::vector<const char *> identities;
+  std::vector<size_t> identity_sizes;
+  identities.reserve(identity_contents.size());
+  identity_sizes.reserve(identity_contents.size());
+  for (const auto &identity : identity_contents) {
+    identities.push_back(identity.data());
+    identity_sizes.push_back(identity.size());
   }
-  auto content =
-      nix_rage_decrypt(identities.data(), identities.size(), filename, cache);
+
+  auto content = nix_rage_decrypt(identities.data(), identity_sizes.data(),
+                                  identities.size(), encrypted.data(),
+                                  encrypted.size(), cache_key.c_str(), cache);
   if (!content) {
     auto err = nix_rage_decrypt_error();
     if (!err) {
@@ -90,6 +124,33 @@ char *decrypt_content(EvalState &state, const PosIdx pos, Value **args) {
   };
 
   return content;
+}
+
+static nix::PrimOp make_primop(const char *name,
+                               std::initializer_list<std::string> args,
+                               const char *doc, nix::PrimOpFun *impl) {
+#if NIX_VERSION_GE(2, 34, 00)
+  nix::PrimOp primop{
+      .name = name,
+      .args = args,
+      .arity = args.size(),
+      .doc = doc,
+      .addTrace = true,
+      .impl = impl,
+      .experimentalFeature = {},
+      .internal = false,
+  };
+#else
+  nix::PrimOp primop{
+      .name = name,
+      .args = args,
+      .arity = args.size(),
+      .doc = doc,
+      .fun = impl,
+      .experimentalFeature = {},
+  };
+#endif
+  return primop;
 }
 
 void prim_importAge(EvalState &state, const PosIdx pos, Value **args,
@@ -123,24 +184,18 @@ void prim_readAgeFile(EvalState &state, const PosIdx pos, Value **args,
   if (!content) {
     throw Error("decrypt error while evaluation");
   };
+#if NIX_VERSION_GE(2, 34, 00)
+  v.mkString(content, state.mem);
+#else
   v.mkString(content);
+#endif
 }
 
 static std::vector<RegisterPrimOp> primops = std::vector{
-    nix::RegisterPrimOp(nix::PrimOp{
-        .name = "importAge",
-        .args = {"identities", "path", "configs"},
-        .arity = 3,
-        .doc = "Import encypted .nix file",
-        .fun = prim_importAge,
-        .experimentalFeature = {},
-    }),
-    nix::RegisterPrimOp(nix::PrimOp{
-        .name = "readAgeFile",
-        .args = {"identities", "path", "configs"},
-        .arity = 3,
-        .doc = "Read encrypted file",
-        .fun = prim_readAgeFile,
-        .experimentalFeature = {},
-    }),
+    nix::RegisterPrimOp(
+        make_primop("importAge", {"identities", "path", "configs"},
+                    "Import encypted .nix file", prim_importAge)),
+    nix::RegisterPrimOp(make_primop("readAgeFile",
+                                    {"identities", "path", "configs"},
+                                    "Read encrypted file", prim_readAgeFile)),
 };

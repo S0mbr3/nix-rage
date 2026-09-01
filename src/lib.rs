@@ -2,7 +2,7 @@ use age::{Decryptor, Identity, IdentityFile};
 use anyhow::{Result, anyhow};
 use std::ffi::{CStr, CString};
 use std::fs::{self, DirBuilder};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::{raw::c_char, unix::fs::OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -112,23 +112,27 @@ impl SecretCache for TempCache {
     }
 }
 
-fn decrypt_file<'a>(
+fn decrypt_content<'a>(
     identities: impl Iterator<Item = &'a dyn Identity>,
-    path: &'a Path,
+    encrypted: &[u8],
 ) -> Result<String> {
-    let file = fs::File::open(path)?;
-    let decryptor = Decryptor::new(file)?;
+    let decryptor = Decryptor::new(encrypted)?;
     let mut stream = decryptor.decrypt(identities)?;
     let mut content = String::new();
     stream.read_to_string(&mut content)?;
     Ok(content)
 }
 
-fn _nix_rage_decrypt(identities: Vec<&str>, filename: &str, cache: bool) -> Result<String> {
-    let identities = identities
+fn _nix_rage_decrypt(
+    identity_contents: Vec<&[u8]>,
+    encrypted: &[u8],
+    cache_key: &str,
+    cache: bool,
+) -> Result<String> {
+    let identities = identity_contents
         .into_iter()
-        .map(&str::to_string)
-        .flat_map(IdentityFile::from_file)
+        .map(BufReader::new)
+        .flat_map(IdentityFile::from_buffer)
         .flat_map(IdentityFile::into_identities)
         .flatten()
         .collect::<Vec<_>>();
@@ -137,8 +141,8 @@ fn _nix_rage_decrypt(identities: Vec<&str>, filename: &str, cache: bool) -> Resu
     } else {
         Box::new(NullCache)
     };
-    let content = cache.load_or(Path::new(filename), &|path| {
-        decrypt_file(identities.iter().map(|b| &**b), path)
+    let content = cache.load_or(Path::new(cache_key), &|_| {
+        decrypt_content(identities.iter().map(|b| &**b), encrypted)
     })?;
     Ok(content)
 }
@@ -167,23 +171,39 @@ pub unsafe extern "C" fn nix_rage_decrypt_error() -> *const c_char {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn nix_rage_decrypt(
     identities: *const *const c_char,
-    size: usize,
-    filename: *const c_char,
+    identity_sizes: *const usize,
+    identity_count: usize,
+    encrypted: *const c_char,
+    encrypted_size: usize,
+    cache_key: *const c_char,
     cache: bool,
 ) -> *const c_char {
-    let fname = unsafe { CStr::from_ptr(filename) }.to_str();
-    let identities = unsafe { std::slice::from_raw_parts(identities, size) }
+    let cache_key = unsafe { CStr::from_ptr(cache_key) }.to_str();
+    let identity_sizes = if identity_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(identity_sizes, identity_count) }
+    };
+    let identity_pointers = if identity_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(identities, identity_count) }
+    };
+    let identities = identity_pointers
         .iter()
-        .map(|ptr| unsafe { CStr::from_ptr(*ptr) }.to_str())
-        .collect::<Result<Vec<_>, _>>();
-    identities
+        .zip(identity_sizes)
+        .map(|(ptr, size)| unsafe { std::slice::from_raw_parts(*ptr as *const u8, *size) })
+        .collect::<Vec<_>>();
+    let encrypted = if encrypted_size == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(encrypted as *const u8, encrypted_size) }
+    };
+    cache_key
+        .map_err(anyhow::Error::from)
+        .and_then(|key| _nix_rage_decrypt(identities, encrypted, key, cache))
+        .map_err(|err| set_error(err.to_string()))
         .ok()
-        .and_then(|i| {
-            fname
-                .ok()
-                .map(|f| _nix_rage_decrypt(i, f, cache))
-                .and_then(|r| r.map_err(|err| set_error(err.to_string())).ok())
-        })
         .and_then(|content| CString::new(content).ok())
         .map(|content| content.into_raw() as *const c_char)
         .unwrap_or(ptr::null())
